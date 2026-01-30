@@ -143,6 +143,59 @@ class TidesService:
 
         return sum(r.water_level_ft for r in readings) / len(readings)
 
+    async def get_tide_level_at_time(self, target_time: datetime) -> Optional[float]:
+        """Get tide level closest to a target UTC time (average of available stations)."""
+        params = {
+            "product": "water_level",
+            "datum": "MLLW",
+            "units": "english",
+            "time_zone": "gmt",
+            "application": "mta_flood_api",
+            "format": "json",
+            "begin_date": (target_time - timedelta(hours=1)).strftime("%Y%m%d"),
+            "end_date": (target_time + timedelta(hours=1)).strftime("%Y%m%d"),
+        }
+
+        readings = []
+        for station_id in self.NOAA_STATIONS.keys():
+            params["station"] = station_id
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(
+                        self.settings.noaa_tides_base_url,
+                        params=params,
+                        timeout=10.0,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+
+                data_points = data.get("data", [])
+                if not data_points:
+                    continue
+
+                # Find closest reading to target time
+                closest = None
+                closest_delta = None
+                for entry in data_points:
+                    ts = datetime.strptime(entry["t"], "%Y-%m-%d %H:%M").replace(
+                        tzinfo=timezone.utc
+                    )
+                    delta = abs((ts - target_time).total_seconds())
+                    if closest_delta is None or delta < closest_delta:
+                        closest_delta = delta
+                        closest = entry
+
+                if closest:
+                    readings.append(float(closest["v"]))
+            except Exception as e:
+                print(f"Error fetching NOAA tide data for {station_id}: {e}")
+                continue
+
+        if not readings:
+            return None
+
+        return sum(readings) / len(readings)
+
     async def get_battery_tide_level(self) -> Optional[float]:
         """Get tide level specifically from The Battery station."""
         if self._is_cache_valid() and "8518750" in self._tide_cache:

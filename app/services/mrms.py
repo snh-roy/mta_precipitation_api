@@ -1,4 +1,5 @@
 import gzip
+import os
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -8,11 +9,18 @@ import boto3
 import httpx
 import numpy as np
 import pandas as pd
-import pygrib
 from botocore import UNSIGNED
 from botocore.config import Config
 
 from app.config import get_settings
+
+settings = get_settings()
+if not os.environ.get("ECCODES_DEFINITION_PATH"):
+    os.environ["ECCODES_DEFINITION_PATH"] = settings.eccodes_definition_path
+if not os.environ.get("ECCODES_SAMPLES_PATH"):
+    os.environ["ECCODES_SAMPLES_PATH"] = settings.eccodes_samples_path
+
+import pygrib
 
 
 class MRMSService:
@@ -39,8 +47,18 @@ class MRMSService:
         "qpe_06h": "MultiSensor_QPE_06H_Pass2",
     }
 
+    HTTP_INTERVAL_MINUTES = {
+        "precip_rate": 2,
+        "qpe_01h": 60,
+        "qpe_06h": 60,
+    }
+
     def __init__(self):
         self.settings = get_settings()
+        if not os.environ.get("ECCODES_DEFINITION_PATH"):
+            os.environ["ECCODES_DEFINITION_PATH"] = self.settings.eccodes_definition_path
+        if not os.environ.get("ECCODES_SAMPLES_PATH"):
+            os.environ["ECCODES_SAMPLES_PATH"] = self.settings.eccodes_samples_path
         self._s3_client = None
         self._precip_cache: dict = {}
         self._cache_time: Optional[datetime] = None
@@ -131,29 +149,94 @@ class MRMSService:
     async def download_and_parse_grib_http(self, url: str) -> Optional[np.ndarray]:
         """Download a GRIB2 file over HTTP and parse it."""
         try:
-            with tempfile.NamedTemporaryFile(suffix=".grib2.gz", delete=False) as tmp_gz:
-                async with httpx.AsyncClient() as client:
+            is_gzip = url.endswith(".gz")
+            suffix = ".grib2.gz" if is_gzip else ".grib2"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp_file:
+                async with httpx.AsyncClient(follow_redirects=True) as client:
                     response = await client.get(url, timeout=30.0)
                     response.raise_for_status()
-                    tmp_gz.write(response.content)
+                    content_type = response.headers.get("Content-Type", "")
+                    if "gzip" not in content_type and "octet-stream" not in content_type:
+                        return None
+                    tmp_file.write(response.content)
 
-                grib_path = tmp_gz.name.replace(".gz", "")
-                with gzip.open(tmp_gz.name, "rb") as gz_file:
-                    with open(grib_path, "wb") as grib_file:
-                        grib_file.write(gz_file.read())
+                if is_gzip:
+                    grib_path = tmp_file.name.replace(".gz", "")
+                    with gzip.open(tmp_file.name, "rb") as gz_file:
+                        with open(grib_path, "wb") as grib_file:
+                            grib_file.write(gz_file.read())
+                else:
+                    grib_path = tmp_file.name
 
                 grbs = pygrib.open(grib_path)
                 grb = grbs[1]
                 data = grb.values
 
                 grbs.close()
-                Path(tmp_gz.name).unlink(missing_ok=True)
-                Path(grib_path).unlink(missing_ok=True)
+                Path(tmp_file.name).unlink(missing_ok=True)
+                if grib_path != tmp_file.name:
+                    Path(grib_path).unlink(missing_ok=True)
 
                 return data
         except Exception as e:
             print(f"Error downloading/parsing GRIB via HTTP: {e}")
             return None
+
+    def _build_http_url(self, product: str, timestamp: datetime) -> str:
+        ts = timestamp.strftime("%Y%m%d-%H%M%S")
+        return (
+            f"{self.settings.mrms_http_base_url}/{product}/"
+            f"MRMS_{product}_00.00_{ts}.grib2.gz"
+        )
+
+    def _build_archive_url(self, product: str, timestamp: datetime) -> str:
+        ts = timestamp.strftime("%Y%m%d-%H%M%S")
+        return (
+            f"{self.settings.mrms_archive_base_url}/"
+            f"{timestamp.strftime('%Y/%m/%d')}/mrms/ncep/{product}/"
+            f"{product}_00.00_{ts}.grib2.gz"
+        )
+
+    async def _find_nearest_http_file(
+        self,
+        product_key: str,
+        target_time: datetime,
+        window_minutes: int = 360,
+        base_source: str = "realtime",
+    ) -> Optional[str]:
+        """Find nearest available MRMS HTTP file within window."""
+        step = self.HTTP_INTERVAL_MINUTES.get(product_key, 2)
+        base_time = target_time.replace(second=0, microsecond=0)
+        offsets = [0]
+        for i in range(1, window_minutes // step + 1):
+            offsets.extend([-i * step, i * step])
+
+        http_product = self.HTTP_PRODUCTS.get(product_key)
+        if not http_product:
+            return None
+
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            for offset in offsets:
+                candidate = base_time + timedelta(minutes=offset)
+                if base_source == "archive":
+                    url = self._build_archive_url(http_product, candidate)
+                else:
+                    url = self._build_http_url(http_product, candidate)
+                try:
+                    if base_source == "archive":
+                        probe = await client.get(
+                            url, headers={"Range": "bytes=0-0"}, timeout=15.0
+                        )
+                        if probe.status_code in (200, 206):
+                            return url
+                    else:
+                        head = await client.head(url, timeout=10.0)
+                        if head.status_code == 200:
+                            return url
+                except Exception:
+                    continue
+
+        return None
 
     def _latlon_to_grid_index(self, lat: float, lon: float) -> tuple[int, int]:
         """Convert lat/lon to MRMS grid indices."""
@@ -214,6 +297,51 @@ class MRMSService:
         self._cache_time = datetime.now(timezone.utc)
 
         return result
+
+    async def fetch_precipitation_data_at_time(
+        self, target_time: datetime
+    ) -> dict[str, Optional[np.ndarray]]:
+        """Fetch MRMS precipitation products closest to a target UTC time via HTTP."""
+        result: dict[str, Optional[np.ndarray]] = {}
+        for product_key in self.HTTP_PRODUCTS.keys():
+            url = await self._find_nearest_http_file(product_key, target_time, base_source="archive")
+            if url:
+                print(f"MRMS archive URL for {product_key}: {url}")
+                data = await self.download_and_parse_grib_http(url)
+                result[product_key] = data
+            else:
+                print(f"MRMS archive URL not found for {product_key} near {target_time.isoformat()}")
+                result[product_key] = None
+        return result
+
+    async def get_station_precipitation_at_time(
+        self, stations_df: pd.DataFrame, target_time: datetime
+    ) -> pd.DataFrame:
+        """Get precipitation data for all stations at a specific time (UTC)."""
+        precip_data = await self.fetch_precipitation_data_at_time(target_time)
+
+        precip_rates = []
+        accum_1hr = []
+        accum_6hr = []
+
+        for _, row in stations_df.iterrows():
+            lat = row["latitude"]
+            lon = row["longitude"]
+
+            rate = self.get_value_at_location(precip_data.get("precip_rate"), lat, lon)
+            qpe_1h = self.get_value_at_location(precip_data.get("qpe_01h"), lat, lon)
+            qpe_6h = self.get_value_at_location(precip_data.get("qpe_06h"), lat, lon)
+
+            precip_rates.append(rate / 25.4 if rate else 0.0)
+            accum_1hr.append(qpe_1h / 25.4 if qpe_1h else 0.0)
+            accum_6hr.append(qpe_6h / 25.4 if qpe_6h else 0.0)
+
+        result_df = stations_df.copy()
+        result_df["precip_rate_in_hr"] = precip_rates
+        result_df["accum_1hr_in"] = accum_1hr
+        result_df["accum_6hr_in"] = accum_6hr
+
+        return result_df
 
     async def get_station_precipitation(
         self, stations_df: pd.DataFrame

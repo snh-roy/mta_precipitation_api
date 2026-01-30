@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import httpx
@@ -18,11 +18,11 @@ class CDOService:
 
     async def _fetch_station_daily_precip(
         self, station_id: str, report_date: str
-    ) -> Optional[float]:
+    ) -> tuple[Optional[float], Optional[str]]:
         """
         Fetch daily precipitation total for a station on a given date.
 
-        Returns inches if CDO is configured for standard units.
+        Returns (value_in_inches, date_string) if CDO is configured for standard units.
         """
         params = {
             "datasetid": "GHCND",
@@ -47,33 +47,58 @@ class CDOService:
 
             results = data.get("results", [])
             if not results:
-                return None
+                return None, None
 
             # GHCN-Daily PRCP in standard units is expected to be inches.
             value = results[0].get("value")
             if value is None:
-                return None
+                return None, None
 
             try:
-                return float(value)
+                return float(value), results[0].get("date")
             except (TypeError, ValueError):
-                return None
+                return None, None
 
         except Exception as e:
             print(f"Error fetching CDO data for {station_id}: {e}")
-            return None
+            return None, None
+
+    async def _fetch_with_fallback(
+        self, station_id: str, report_date: str, fallback_days: int = 7
+    ) -> tuple[Optional[float], Optional[str]]:
+        """Fetch daily precip for report_date, fallback to most recent within fallback_days."""
+        value, date_str = await self._fetch_station_daily_precip(station_id, report_date)
+        if value is not None:
+            return value, date_str
+
+        # Try previous days up to fallback_days
+        try:
+            base_date = datetime.strptime(report_date, "%Y-%m-%d")
+        except ValueError:
+            return None, None
+
+        for i in range(1, fallback_days + 1):
+            candidate = (base_date - timedelta(days=i)).strftime("%Y-%m-%d")
+            value, date_str = await self._fetch_station_daily_precip(station_id, candidate)
+            if value is not None:
+                return value, date_str
+
+        return None, None
 
     async def get_daily_precip_totals(self, report_date: str) -> dict[str, Optional[float]]:
         """Fetch daily precipitation totals for Central Park, JFK, and LaGuardia."""
         settings = self.settings
-        cp = await self._fetch_station_daily_precip(settings.ghcnd_central_park_station, report_date)
-        jfk = await self._fetch_station_daily_precip(settings.ghcnd_jfk_station, report_date)
-        lga = await self._fetch_station_daily_precip(settings.ghcnd_lga_station, report_date)
+        cp, cp_date = await self._fetch_with_fallback(settings.ghcnd_central_park_station, report_date)
+        jfk, jfk_date = await self._fetch_with_fallback(settings.ghcnd_jfk_station, report_date)
+        lga, lga_date = await self._fetch_with_fallback(settings.ghcnd_lga_station, report_date)
 
         return {
             "central_park_daily_in": cp,
+            "central_park_daily_date": cp_date,
             "jfk_daily_in": jfk,
+            "jfk_daily_date": jfk_date,
             "lga_daily_in": lga,
+            "lga_daily_date": lga_date,
         }
 
     async def is_available(self) -> bool:

@@ -1,9 +1,11 @@
-from datetime import datetime, timezone
+import asyncio
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import COASTAL_STATIONS, VALID_BOROUGHS, get_settings
 from app.models import (
@@ -16,6 +18,7 @@ from app.models import (
     TidesResponse,
 )
 from app.services.mrms import mrms_service
+from app.services.stage4 import stage4_service
 from app.services.stations import stations_service
 from app.services.tides import tides_service
 from app.services.cdo import cdo_service
@@ -32,6 +35,40 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8080", "http://127.0.0.1:8080"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+async def _fetch_forecasts_for_stations(stations_df):
+    """Fetch forecast totals for unique lat/lon keys to reduce calls."""
+    # Deduplicate by rounded lat/lon to reuse gridpoint responses
+    key_to_coords = {}
+    for _, row in stations_df.iterrows():
+        lat = float(row["latitude"])
+        lon = float(row["longitude"])
+        key = f"{round(lat, 3)},{round(lon, 3)}"
+        if key not in key_to_coords:
+            key_to_coords[key] = (lat, lon)
+
+    semaphore = asyncio.Semaphore(10)
+    results = {}
+
+    async def _fetch(key, lat, lon):
+        async with semaphore:
+            totals = await forecast_service.get_forecast_totals(lat, lon)
+            results[key] = totals
+
+    tasks = [_fetch(k, v[0], v[1]) for k, v in key_to_coords.items()]
+    if tasks:
+        await asyncio.gather(*tasks)
+
+    return results
 
 
 @app.on_event("startup")
@@ -54,7 +91,12 @@ async def root():
 @app.get("/api/report", response_model=FullReportResponse)
 async def get_report(
     date: Optional[str] = Query(None, description="Report date (YYYY-MM-DD), defaults to today"),
+    time: Optional[str] = Query(None, description="Report time (HH:MM), optional"),
     borough: Optional[str] = Query(None, description="Filter by borough"),
+    stations: Optional[str] = Query(
+        None,
+        description="Comma-separated list of station names to include",
+    ),
     risk_only: bool = Query(False, description="Only return HIGH or AT RISK stations"),
     format: ReportFormat = Query(ReportFormat.JSON, description="Output format: json, csv, or xlsx"),
 ):
@@ -64,6 +106,10 @@ async def get_report(
     Returns precipitation data, tide levels (for coastal stations), and
     calculated flood risk for each subway station.
     """
+    # Normalize borough label
+    if borough == "The Bronx":
+        borough = "Bronx"
+
     # Validate borough if provided
     if borough and borough not in VALID_BOROUGHS:
         raise HTTPException(
@@ -76,32 +122,82 @@ async def get_report(
     generated_at = datetime.now(timezone.utc)
     generated_local = generated_at.astimezone(local_tz)
     report_date = date or generated_local.strftime("%Y-%m-%d")
+    try:
+        report_date_obj = datetime.strptime(report_date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+    if report_date_obj < datetime(2021, 1, 1).date():
+        raise HTTPException(status_code=400, detail="Date must be on or after 2021-01-01.")
+    requested_local = generated_local
+    if time:
+        try:
+            parsed_time = datetime.strptime(time, "%H:%M").time()
+            requested_local = datetime.strptime(report_date, "%Y-%m-%d").replace(
+                hour=parsed_time.hour,
+                minute=parsed_time.minute,
+                tzinfo=local_tz,
+            )
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid time format. Use HH:MM (24-hour).")
+    if not time:
+        requested_local = generated_local
+
     is_today = report_date == generated_local.strftime("%Y-%m-%d")
+    now_local = generated_local
+    use_historical = requested_local < now_local - timedelta(minutes=5)
+    use_forecast = is_today
 
     try:
         # Get stations
         stations_df = await stations_service.get_stations(borough=borough)
+        if stations:
+            station_list = [s.strip().lower() for s in stations.split(",") if s.strip()]
+            if station_list:
+                stations_df = stations_df[
+                    stations_df["station_name"].str.lower().isin(station_list)
+                ]
 
         # Get precipitation data
         try:
-            stations_df = await mrms_service.get_station_precipitation(stations_df)
+            if use_historical:
+                stations_df, _ = await stage4_service.get_station_precipitation_at_time(
+                    stations_df,
+                    requested_local.astimezone(timezone.utc),
+                )
+            else:
+                stations_df = await mrms_service.get_station_precipitation(stations_df)
         except Exception as e:
             raise HTTPException(
                 status_code=503,
-                detail=f"NOAA MRMS data unavailable: {str(e)}",
+                detail=f"NOAA precipitation data unavailable: {str(e)}",
             )
 
         # Get tide level for coastal stations
-        tide_level = await tides_service.get_current_tide_level()
+        if use_historical:
+            tide_level = await tides_service.get_tide_level_at_time(
+                requested_local.astimezone(timezone.utc)
+            )
+        else:
+            tide_level = await tides_service.get_current_tide_level()
 
         # Fetch daily totals from NCEI CDO (Central Park, JFK, LaGuardia)
         cdo_totals = await cdo_service.get_daily_precip_totals(report_date)
+
+        # Pre-fetch forecasts for unique gridpoints when report is for today
+        forecast_map = {}
+        if use_forecast:
+            forecast_map = await _fetch_forecasts_for_stations(stations_df)
 
         # Build station reports
         station_reports = []
         for _, row in stations_df.iterrows():
             is_coastal = row.get("is_coastal", False) or row["station_name"] in COASTAL_STATIONS
             station_tide = tide_level if is_coastal else None
+            cbd_value = row.get("cbd")
+            if isinstance(cbd_value, bool):
+                cbd_value = "Y" if cbd_value else "N"
+            elif cbd_value is not None:
+                cbd_value = str(cbd_value)
 
             risk, risk_reason = calculate_risk_with_reason(
                 structure=row["structure"],
@@ -116,9 +212,10 @@ async def get_report(
             predicted_risk_6hr = None
             predicted_risk_24hr = None
 
-            if is_today:
-                forecast_6hr_in, forecast_24hr_in = await forecast_service.get_forecast_totals(
-                    row["latitude"], row["longitude"]
+            if use_forecast:
+                key = f"{round(float(row['latitude']), 3)},{round(float(row['longitude']), 3)}"
+                forecast_6hr_in, forecast_24hr_in, _ = forecast_map.get(
+                    key, (None, None, None)
                 )
 
                 if forecast_6hr_in is not None:
@@ -148,8 +245,11 @@ async def get_report(
             full_borough = borough_map.get(row["borough"], row["borough"])
 
             report = StationReport(
+                line=row.get("line"),
                 station_name=row["station_name"],
                 borough=full_borough,
+                cbd=cbd_value,
+                daytime_routes=row.get("daytime_routes"),
                 structure=row["structure"],
                 latitude=row["latitude"],
                 longitude=row["longitude"],
@@ -158,8 +258,11 @@ async def get_report(
                 accum_6hr_in=round(row.get("accum_6hr_in", 0), 4),
                 tide_level_ft=round(station_tide, 2) if station_tide else None,
                 central_park_daily_in=cdo_totals.get("central_park_daily_in"),
+                central_park_daily_date=cdo_totals.get("central_park_daily_date"),
                 jfk_daily_in=cdo_totals.get("jfk_daily_in"),
+                jfk_daily_date=cdo_totals.get("jfk_daily_date"),
                 lga_daily_in=cdo_totals.get("lga_daily_in"),
+                lga_daily_date=cdo_totals.get("lga_daily_date"),
                 forecast_6hr_in=round(forecast_6hr_in, 4)
                 if forecast_6hr_in is not None
                 else None,
@@ -180,8 +283,8 @@ async def get_report(
 
         # Handle different output formats
         if format == ReportFormat.XLSX:
-            excel_file = generate_excel_report(station_reports, report_date, generated_local)
-            filename = f"mta_flood_report_{report_date}.xlsx"
+            excel_file = generate_excel_report(station_reports, report_date, requested_local)
+            filename = f"mta_precp_{report_date}.xlsx"
             return StreamingResponse(
                 excel_file,
                 media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -189,8 +292,8 @@ async def get_report(
             )
 
         if format == ReportFormat.CSV:
-            csv_content = generate_csv_report(station_reports, report_date, generated_local)
-            filename = f"mta_flood_report_{report_date}.csv"
+            csv_content = generate_csv_report(station_reports, report_date, requested_local)
+            filename = f"mta_precp_{report_date}.csv"
             return Response(
                 content=csv_content,
                 media_type="text/csv",
@@ -199,7 +302,7 @@ async def get_report(
 
         # Default: JSON response
         return FullReportResponse(
-            generated_at=generated_local,
+            generated_at=requested_local,
             report_date=report_date,
             source="NOAA MRMS; NOAA CDO; NWS",
             station_count=len(station_reports),
@@ -350,8 +453,11 @@ async def get_station_detail(station_name: str):
         accum_6hr_in=round(precip_data.get("accum_6hr_in", 0), 4),
         tide_level_ft=round(tide_level, 2) if tide_level else None,
         central_park_daily_in=cdo_totals.get("central_park_daily_in"),
+        central_park_daily_date=cdo_totals.get("central_park_daily_date"),
         jfk_daily_in=cdo_totals.get("jfk_daily_in"),
+        jfk_daily_date=cdo_totals.get("jfk_daily_date"),
         lga_daily_in=cdo_totals.get("lga_daily_in"),
+        lga_daily_date=cdo_totals.get("lga_daily_date"),
         forecast_6hr_in=round(forecast_6hr_in, 4) if forecast_6hr_in is not None else None,
         forecast_24hr_in=round(forecast_24hr_in, 4) if forecast_24hr_in is not None else None,
         predicted_risk_6hr=predicted_risk_6hr,

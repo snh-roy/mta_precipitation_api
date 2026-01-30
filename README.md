@@ -1,26 +1,26 @@
-# MTA Flood Risk Monitoring API
+# MTA Rainfall API
 
-A FastAPI application that provides real-time flood risk monitoring for NYC MTA subway stations by combining NOAA MRMS precipitation data with tide levels.
+This is a FastAPI application that provides precipitation, tide, and flood‑risk reporting for NYC MTA subway stations. It supports current conditions and some historical reports with Excel/CSV exports.
 
-## Features
+## Features & and Their Source
 
-- Real-time precipitation data from NOAA MRMS (AWS S3)
-- Tide levels from NOAA Tides & Currents API
-- Daily precipitation totals from NOAA NCEI CDO (Central Park, JFK, LGA)
-- 6/24 hour precipitation forecasts from NWS gridpoint API
-- Risk calculation based on station structure type, precipitation rate, accumulation, and tide levels
-- Predictive risk based on 6/24 hour forecast totals
+- Current precipitation data from NOAA MRMS (precip rate, 1‑hour, 6‑hour)
+- Historical precipitation from NCEP Stage IV hourly archive
+- Tide levels from NOAA Tides & Currents API (current and historical at time)
+- Daily precipitation totals from NOAA NCEI CDO (Central Park, JFK, LGA) with fallback to last 7 days if same‑day is unavailable
+- 6/24 hour precipitation forecasts from NWS gridpoint API (today only)
+- Risk calculation based on station structure type, precipitation rate/accumulation, and tide level
 - Excel/CSV export compatible with Power BI
-- Full API documentation via Swagger UI
 
 ## Data Sources
 
 | Source | Data | Update Frequency |
 |--------|------|------------------|
-| NOAA MRMS | Precipitation rate, 1hr/6hr accumulation | 2 minutes |
+| NOAA MRMS | Current precip rate, 1hr/6hr accumulation | ~2 minutes |
+| NCEP Stage IV (IEM archive) | Historical hourly precipitation (2021‑present) | Hourly |
 | NOAA Tides | Water levels at The Battery and Kings Point | 6 minutes |
 | NOAA NCEI CDO (GHCN-Daily) | Central Park / JFK / LGA daily precip totals | Daily |
-| NWS Gridpoint API | 6hr/24hr precipitation forecasts | Hourly |
+| NWS Gridpoint API | 6hr/24hr precipitation forecasts (today only) | Hourly |
 | MTA | Station locations, structure types | Static (cached) |
 
 ## Installation
@@ -29,6 +29,7 @@ A FastAPI application that provides real-time flood risk monitoring for NYC MTA 
 
 - Python 3.10+
 - pip or conda
+
 
 ### Setup
 
@@ -48,7 +49,8 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-4. Copy the environment file:
+4. Copy .env.example → .env and set:
+NCEI_CDO_TOKEN=...
 ```bash
 cp .env.example .env
 ```
@@ -68,8 +70,10 @@ Generate a full precipitation report for all MTA stations.
 
 **Query Parameters:**
 - `date` (optional): Report date (YYYY-MM-DD), defaults to today
+- `time` (optional): Report time (HH:MM, 24‑hour)
 - `borough` (optional): Filter by Manhattan, Brooklyn, Queens, Bronx, or Staten Island
-- `risk_only` (optional): Only return HIGH or AT RISK stations
+- `stations` (optional): Comma‑separated station names to include
+- `risk_only` (optional): Only return FLOOD WATCH or FLOOD WARNING stations
 - `format` (optional): Output format - json, csv, or xlsx
 
 **Example:**
@@ -79,6 +83,9 @@ curl "http://localhost:8000/api/report"
 
 # Get Excel report for Manhattan only
 curl "http://localhost:8000/api/report?borough=Manhattan&format=xlsx" -o report.xlsx
+
+# Get Excel report for a specific date/time - I chose January 10th  2025
+curl "http://localhost:8000/api/report?date=2025-01-10&time=22:00&format=xlsx" -o ida.xlsx
 
 # Get only high-risk stations
 curl "http://localhost:8000/api/report?risk_only=true"
@@ -121,6 +128,17 @@ Get current tide levels from NOAA stations.
 ```bash
 curl "http://localhost:8000/api/tides"
 ```
+### Likely issues & fixes
+
+1. Python deps / pygrib
+      - pygrib can be tricky on some systems (especially Windows).
+      - On macOS/Linux, it usually installs via pip; on Windows you might need conda (conda install -c conda-forge pygrib).
+2. numpy/pandas version compatibility
+      - You might have to downgrade to numpy<2 because of binary incompatibilities.
+      - On fresh environments, this may not be an issue, but if you see errors, pin numpy<2 in requirements.txt
+3. Network access
+      - MRMS, Stage IV archive, NWS, NOAA tides, and NCEI all require outbound HTTPS.
+      - If you are on a corporate network, firewall/proxy could block. Health endpoint will show “degraded”.
 
 ### GET /api/health
 
@@ -139,7 +157,7 @@ Risk levels are calculated based on:
 
 ## Coastal Stations
 
-The following stations have tide data applied to their risk calculations:
+These stations have tide data applied to their risk calculations:
 
 - Broad Channel
 - Howard Beach-JFK Airport
@@ -159,23 +177,41 @@ The Excel export includes:
 | Date | Report date |
 | Time | Report generation time |
 | Time Zone | Time zone for report time (America/New_York) |
-| Station Name | MTA station name |
+| Station Line | MTA line name |
+| Stop Name | MTA stop name |
 | Borough | NYC borough |
+| CBD | Central Business District indicator (from MTA data) |
+| Daytime Routes | MTA daytime routes |
 | Structure | Station structure type |
+| GTFS Latitude | Station latitude |
+| GTFS Longitude | Station longitude |
 | Precip Rate (in/hr) | Current precipitation rate |
 | 1hr Accumulation (in) | 1-hour precipitation total |
 | 6hr Accumulation (in) | 6-hour precipitation total |
 | Tide Level (ft) | Current tide level (coastal only) |
 | Central Park Daily (in) | Daily total precip at Central Park (GHCN-Daily) |
+| Central Park Daily Date | Date of the daily total used (fallback within last 7 days) |
 | JFK Daily (in) | Daily total precip at JFK Airport (GHCN-Daily) |
+| JFK Daily Date | Date of the daily total used (fallback within last 7 days) |
 | LaGuardia Daily (in) | Daily total precip at LaGuardia Airport (GHCN-Daily) |
+| LaGuardia Daily Date | Date of the daily total used (fallback within last 7 days) |
 | Forecast 6hr (in) | Forecast total precipitation next 6 hours (NWS) |
 | Forecast 24hr (in) | Forecast total precipitation next 24 hours (NWS) |
 | Predicted Risk 6hr | Risk level based on 6-hour forecast |
 | Predicted Risk 24hr | Risk level based on 24-hour forecast |
-| Risk Level | HIGH, AT RISK, or LOW |
+| Risk Level | FLOOD WARNING, FLOOD WATCH, or CLEAR |
 | Risk Reason | Short explanation of why the risk level was assigned |
 | Source | Data sources (NOAA MRMS / NOAA CDO / NWS) |
+
+## Historical vs Current Behavior
+
+- **Today:** MRMS + current tides + NWS forecasts
+- **Past dates (2021‑present):** Stage IV hourly precipitation + tides at requested time, no forecasts
+
+## Limitations
+
+- Historical precipitation depends on archive availability; some hours may be missing.
+- Daily station totals (CDO) are posted after the day ends; the API falls back to the most recent available day (up to 7 days).
 
 ## Configuration
 

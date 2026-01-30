@@ -57,7 +57,7 @@ class ForecastService:
         headers = {"User-Agent": "mta-flood-api"}
 
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(follow_redirects=True) as client:
                 response = await client.get(url, headers=headers, timeout=15.0)
                 response.raise_for_status()
                 data = response.json()
@@ -74,7 +74,7 @@ class ForecastService:
 
         headers = {"User-Agent": "mta-flood-api"}
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(follow_redirects=True) as client:
                 response = await client.get(grid_url, headers=headers, timeout=15.0)
                 response.raise_for_status()
                 data = response.json()
@@ -87,26 +87,26 @@ class ForecastService:
 
     async def get_forecast_totals(
         self, lat: float, lon: float
-    ) -> tuple[Optional[float], Optional[float]]:
+    ) -> tuple[Optional[float], Optional[float], Optional[str]]:
         """
         Return (next_6hr_total_in, next_24hr_total_in) from NWS gridpoint data.
         """
         points = await self._fetch_points(lat, lon)
         if not points:
-            return None, None
+            return None, None, None
 
         grid_url = points.get("properties", {}).get("forecastGridData")
         if not grid_url:
-            return None, None
+            return None, None, None
 
         grid = await self._fetch_grid(grid_url)
         if not grid:
-            return None, None
+            return None, None, None
 
         qpf = grid.get("properties", {}).get("quantitativePrecipitation", {})
         values = qpf.get("values", [])
         if not values:
-            return None, None
+            return None, None, grid_url
 
         now = datetime.now(timezone.utc)
         total_6h_mm = 0.0
@@ -146,7 +146,7 @@ class ForecastService:
                 total_24h_mm += value_mm * (overlap_24 / hours)
 
         # Convert mm to inches
-        return total_6h_mm / 25.4, total_24h_mm / 25.4
+        return total_6h_mm / 25.4, total_24h_mm / 25.4, grid_url
 
 
 forecast_service = ForecastService()

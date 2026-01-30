@@ -32,9 +32,14 @@ def generate_excel_report(
             "Date": report_date,
             "Time": generated_at.strftime("%H:%M:%S"),
             "Time Zone": generated_at.tzname() if generated_at.tzinfo else "UTC",
-            "Station Name": station.station_name,
+            "Station Line": station.line,
+            "Stop Name": station.station_name,
             "Borough": station.borough,
+            "CBD": station.cbd,
+            "Daytime Routes": station.daytime_routes,
             "Structure": station.structure,
+            "GTFS Latitude": station.latitude,
+            "GTFS Longitude": station.longitude,
             "Precip Rate (in/hr)": round(station.precip_rate_in_hr or 0, 3),
             "1hr Accumulation (in)": round(station.accum_1hr_in or 0, 3),
             "6hr Accumulation (in)": round(station.accum_6hr_in or 0, 3),
@@ -42,12 +47,15 @@ def generate_excel_report(
             "Central Park Daily (in)": round(station.central_park_daily_in, 3)
             if station.central_park_daily_in is not None
             else None,
+            "Central Park Daily Date": station.central_park_daily_date,
             "JFK Daily (in)": round(station.jfk_daily_in, 3)
             if station.jfk_daily_in is not None
             else None,
+            "JFK Daily Date": station.jfk_daily_date,
             "LaGuardia Daily (in)": round(station.lga_daily_in, 3)
             if station.lga_daily_in is not None
             else None,
+            "LaGuardia Daily Date": station.lga_daily_date,
             "Forecast 6hr (in)": round(station.forecast_6hr_in, 3)
             if station.forecast_6hr_in is not None
             else None,
@@ -93,9 +101,9 @@ def generate_excel_report(
 
         # Risk level colors
         risk_colors = {
-            "HIGH": PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid"),
-            "AT RISK": PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid"),
-            "LOW": PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid"),
+            "FLOOD WARNING": PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid"),
+            "FLOOD WATCH": PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid"),
+            "CLEAR": PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid"),
         }
 
         # Style data rows
@@ -104,12 +112,12 @@ def generate_excel_report(
                 cell.border = thin_border
                 cell.alignment = Alignment(horizontal="center", vertical="center")
 
-        # Color the risk level cell (column R = 18th column)
-            risk_cell = worksheet.cell(row=row_idx, column=18)
+        # Color the risk level cell (column Z = 26th column)
+            risk_cell = worksheet.cell(row=row_idx, column=26)
             risk_value = risk_cell.value
             if risk_value in risk_colors:
                 risk_cell.fill = risk_colors[risk_value]
-                if risk_value == "HIGH":
+                if risk_value == "FLOOD WARNING":
                     risk_cell.font = Font(color="FFFFFF", bold=True)
 
         # Auto-adjust column widths
@@ -117,23 +125,31 @@ def generate_excel_report(
             "A": 12,  # Date
             "B": 10,  # Time
             "C": 12,  # Time Zone
-            "D": 30,  # Station Name
-            "E": 12,  # Borough
-            "F": 12,  # Structure
-            "G": 18,  # Precip Rate
-            "H": 22,  # 1hr Accumulation
-            "I": 22,  # 6hr Accumulation
-            "J": 15,  # Tide Level
-            "K": 22,  # Central Park Daily
-            "L": 18,  # JFK Daily
-            "M": 20,  # LaGuardia Daily
-            "N": 18,  # Forecast 6hr
-            "O": 18,  # Forecast 24hr
-            "P": 18,  # Predicted Risk 6hr
-            "Q": 18,  # Predicted Risk 24hr
-            "R": 12,  # Risk Level
-            "S": 35,  # Risk Reason
-            "T": 18,  # Source
+            "D": 12,  # Station Line
+            "E": 30,  # Stop Name
+            "F": 12,  # Borough
+            "G": 8,   # CBD
+            "H": 20,  # Daytime Routes
+            "I": 12,  # Structure
+            "J": 14,  # GTFS Latitude
+            "K": 14,  # GTFS Longitude
+            "L": 18,  # Precip Rate
+            "M": 22,  # 1hr Accumulation
+            "N": 22,  # 6hr Accumulation
+            "O": 15,  # Tide Level
+            "P": 22,  # Central Park Daily
+            "Q": 20,  # Central Park Daily Date
+            "R": 18,  # JFK Daily
+            "S": 18,  # JFK Daily Date
+            "T": 20,  # LaGuardia Daily
+            "U": 20,  # LaGuardia Daily Date
+            "V": 18,  # Forecast 6hr
+            "W": 18,  # Forecast 24hr
+            "X": 18,  # Predicted Risk 6hr
+            "Y": 18,  # Predicted Risk 24hr
+            "Z": 12,  # Risk Level
+            "AA": 35,  # Risk Reason
+            "AB": 18,  # Source
         }
 
         for col, width in column_widths.items():
@@ -144,9 +160,9 @@ def generate_excel_report(
 
         # Add summary sheet
         summary_ws = workbook.create_sheet("Summary")
-        high_count = sum(1 for s in stations if s.risk_level.value == "HIGH")
-        at_risk_count = sum(1 for s in stations if s.risk_level.value == "AT RISK")
-        low_count = sum(1 for s in stations if s.risk_level.value == "LOW")
+        high_count = sum(1 for s in stations if s.risk_level.value == "FLOOD WARNING")
+        at_risk_count = sum(1 for s in stations if s.risk_level.value == "FLOOD WATCH")
+        low_count = sum(1 for s in stations if s.risk_level.value == "CLEAR")
 
         summary_data = [
             ["MTA Flood Risk Report Summary"],
@@ -189,9 +205,14 @@ def generate_csv_report(
             "Date": report_date,
             "Time": generated_at.strftime("%H:%M:%S"),
             "Time Zone": generated_at.tzname() if generated_at.tzinfo else "UTC",
-            "Station Name": station.station_name,
+            "Station Line": station.line,
+            "Stop Name": station.station_name,
             "Borough": station.borough,
+            "CBD": station.cbd,
+            "Daytime Routes": station.daytime_routes,
             "Structure": station.structure,
+            "GTFS Latitude": station.latitude,
+            "GTFS Longitude": station.longitude,
             "Precip Rate (in/hr)": round(station.precip_rate_in_hr or 0, 3),
             "1hr Accumulation (in)": round(station.accum_1hr_in or 0, 3),
             "6hr Accumulation (in)": round(station.accum_6hr_in or 0, 3),
@@ -199,12 +220,15 @@ def generate_csv_report(
             "Central Park Daily (in)": round(station.central_park_daily_in, 3)
             if station.central_park_daily_in is not None
             else "",
+            "Central Park Daily Date": station.central_park_daily_date or "",
             "JFK Daily (in)": round(station.jfk_daily_in, 3)
             if station.jfk_daily_in is not None
             else "",
+            "JFK Daily Date": station.jfk_daily_date or "",
             "LaGuardia Daily (in)": round(station.lga_daily_in, 3)
             if station.lga_daily_in is not None
             else "",
+            "LaGuardia Daily Date": station.lga_daily_date or "",
             "Forecast 6hr (in)": round(station.forecast_6hr_in, 3)
             if station.forecast_6hr_in is not None
             else "",

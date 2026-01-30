@@ -6,9 +6,9 @@ from pydantic import BaseModel, Field
 
 
 class RiskLevel(str, Enum):
-    HIGH = "HIGH"
-    AT_RISK = "AT RISK"
-    LOW = "LOW"
+    HIGH = "FLOOD WARNING"
+    AT_RISK = "FLOOD WATCH"
+    LOW = "CLEAR"
 
 
 class ReportFormat(str, Enum):
@@ -37,8 +37,11 @@ class StationTide(BaseModel):
 
 
 class StationReport(BaseModel):
+    line: Optional[str] = None
     station_name: str
     borough: str
+    cbd: Optional[str] = None
+    daytime_routes: Optional[str] = None
     structure: str
     latitude: float
     longitude: float
@@ -47,8 +50,11 @@ class StationReport(BaseModel):
     accum_6hr_in: Optional[float] = None
     tide_level_ft: Optional[float] = None
     central_park_daily_in: Optional[float] = None
+    central_park_daily_date: Optional[str] = None
     jfk_daily_in: Optional[float] = None
+    jfk_daily_date: Optional[str] = None
     lga_daily_in: Optional[float] = None
+    lga_daily_date: Optional[str] = None
     forecast_6hr_in: Optional[float] = None
     forecast_24hr_in: Optional[float] = None
     predicted_risk_6hr: Optional[RiskLevel] = None
@@ -102,8 +108,11 @@ class StationDetailResponse(BaseModel):
     accum_6hr_in: Optional[float] = None
     tide_level_ft: Optional[float] = None
     central_park_daily_in: Optional[float] = None
+    central_park_daily_date: Optional[str] = None
     jfk_daily_in: Optional[float] = None
+    jfk_daily_date: Optional[str] = None
     lga_daily_in: Optional[float] = None
+    lga_daily_date: Optional[str] = None
     forecast_6hr_in: Optional[float] = None
     forecast_24hr_in: Optional[float] = None
     predicted_risk_6hr: Optional[RiskLevel] = None

@@ -10,12 +10,19 @@ class Settings(BaseSettings):
 
     # MTA Station Data
     mta_stations_url: str = "http://web.mta.info/developers/data/nyct/subway/Stations.csv"
-    stations_cache_path: str = "app/data/stations.csv"
+    stations_cache_path: str = "app/data/MTA_Subway_Stations.csv"
 
     # NOAA MRMS S3 Bucket
     mrms_bucket: str = "noaa-mrms-pds"
     mrms_region: str = "us-east-1"
     mrms_http_base_url: str = "https://mrms.ncep.noaa.gov/2D"
+    mrms_archive_base_url: str = "https://mtarchive.geol.iastate.edu/thredds/fileServer/mtarchive"
+    stage4_archive_base_url: str = "https://mesonet.agron.iastate.edu/archive/data"
+    stage4_archive_fallback_base_url: str = "https://mesonet2.agron.iastate.edu/archive/data"
+
+    # ECCODES paths for GRIB decoding (pygrib)
+    eccodes_definition_path: str = "/opt/anaconda3/share/eccodes/definitions"
+    eccodes_samples_path: str = "/opt/anaconda3/share/eccodes/samples"
 
     # NOAA Tides & Currents API
     noaa_tides_base_url: str = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"

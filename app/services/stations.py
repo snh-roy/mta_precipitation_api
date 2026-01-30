@@ -56,6 +56,7 @@ class StationsService:
             "Line": "line",
             "Stop Name": "station_name",
             "Borough": "borough",
+            "CBD": "cbd",
             "Daytime Routes": "daytime_routes",
             "Structure": "structure",
             "GTFS Latitude": "latitude",
@@ -74,8 +75,6 @@ class StationsService:
         df["is_coastal"] = df["station_name"].apply(
             lambda x: x in COASTAL_STATIONS if pd.notna(x) else False
         )
-
-        df = df.drop_duplicates(subset=["station_name", "borough"], keep="first")
 
         return df
 
